@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Question Bank Retrieval</title>
+<style>
+:root{--bg:#f6f5f1;--fg:#1d1d1b;--card:#fff;--line:#d9d6cc;--acc:#2f5d8a;--mut:#6b6a63;--err:#a33}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#1b1c1e;--fg:#e8e6e0;--card:#24262a;--line:#3a3d43;--acc:#7fb0e0;--mut:#9a9a94;--err:#e88}}
+:root[data-theme="dark"]{--bg:#1b1c1e;--fg:#e8e6e0;--card:#24262a;--line:#3a3d43;--acc:#7fb0e0;--mut:#9a9a94;--err:#e88}
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);padding:16px}
+main{max-width:860px;margin:0 auto;display:grid;gap:14px}
+h1{font-size:20px;margin:0}
+h2{font-size:14px;margin:0 0 8px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+textarea,input{width:100%;font:13px/1.4 ui-monospace,Menlo,Consolas,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px}
+textarea{min-height:130px;resize:vertical}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+button{font:inherit;background:var(--acc);color:#fff;border:0;border-radius:6px;padding:8px 12px;cursor:pointer}
+button.ghost{background:transparent;color:var(--acc);border:1px solid var(--line)}
+button:disabled{opacity:.5;cursor:wait}
+.chip{font:12px ui-monospace,Menlo,monospace;padding:4px 8px}
+pre{margin:0;white-space:pre-wrap;word-break:break-word;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+.status{color:var(--mut);font-size:13px}
+.err{color:var(--err)}
+.help{color:var(--mut);font-size:13px;margin:6px 0 0}
+code{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}
+</style>
+</head>
+<body>
+<main>
+  <h1>Question Bank Retrieval</h1>
+
+  <section class="card">
+    <h2>1. Questions</h2>
+    <textarea id="qs" spellcheck="false" aria-label="Questions input"></textarea>
+    <p class="help">Format: optional count line, then one question per line: <code>id unit co bloom difficulty</code>, e.g. <code>P1 1 CO1 K2 EASY</code>. Bloom is K1–K6; difficulty is EASY, MEDIUM or HARD.</p>
+    <div class="row">
+      <button id="load">Load questions</button>
+      <button class="ghost" id="gen">Generate 100,000 random</button>
+      <span class="status" id="status"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>2. Query</h2>
+    <input id="q" value="FIND unit=1 co=CO1 maxbloom=K3" aria-label="Query" spellcheck="false">
+    <p class="help">Terms: <code>unit=1</code> <code>co=CO1</code> <code>bloom=K3</code> <code>bloom&lt;=K3</code> <code>bloom&gt;=K2</code> <code>maxbloom=K3</code> <code>diff=HARD</code>. Operators: <code>AND</code> <code>OR</code> <code>NOT</code> and parentheses. Adjacent terms are ANDed, so <code>FIND unit=1 co=CO1</code> works. Add <code>RANK easy=30 medium=50 hard=20</code> to order results by closeness to a difficulty mix.</p>
+    <div class="row">
+      <button id="run">Run query</button>
+      <button class="ghost chip" data-q="FIND (unit=1 OR unit=2) AND NOT diff=HARD">(unit=1 OR unit=2) AND NOT diff=HARD</button>
+      <button class="ghost chip" data-q="FIND co=CO1 AND bloom&gt;=K3 RANK easy=20 medium=50 hard=30">ranked mix</button>
+      <button class="ghost chip" id="stress">Stress: 10,000 queries</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>3. Output</h2>
+    <pre id="out">Load questions, then run a query.</pre>
+  </section>
+</main>
+
+<script>
+const LEVELS = ['K1','K2','K3','K4','K5','K6'];
+const DIFFS = ['EASY','MEDIUM','HARD'];
+const SAMPLE = `4
+P1 1 CO1 K2 EASY
+P2 1 CO1 K4 HARD
+P3 2 CO2 K3 MEDIUM
+P4 1 CO1 K3 MEDIUM`;
+
+let IX = null; // {n, qs, idx: Map(key -> bitset)}
+const $ = id => document.getElementById(id);
+const rnd = n => Math.floor(Math.random() * n);
+
+/* ---------- bitsets: one Uint32Array per attribute value ---------- */
+const bsNew = n => new Uint32Array((n + 31) >>> 5);
+const bsSet = (b, i) => { b[i >>> 5] |= 1 << (i & 31); };
+function bsAnd(a, b) { const r = new Uint32Array(a.length); for (let i = 0; i < a.length; i++) r[i] = a[i] & b[i]; return r; }
+function bsOr(a, b)  { const r = new Uint32Array(a.length); for (let i = 0; i < a.length; i++) r[i] = a[i] | b[i]; return r; }
+function bsNot(a, n) {
+  const r = new Uint32Array(a.length);
+  for (let i = 0; i < a.length; i++) r[i] = ~a[i];
+  const extra = a.length * 32 - n;             // clear padding bits past n
+  if (extra) r[r.length - 1] &= (0xFFFFFFFF >>> extra);
+  return r;
+}
+function bsIndexes(a, n) {
+  const out = [];
+  for (let i = 0; i < a.length; i++) {
+    let w = a[i];
+    while (w) {
+      const low = w & -w;
+      const idx = (i << 5) + (31 - Math.clz32(low));
+      if (idx < n) out.push(idx);
+      w ^= low;
+    }
+  }
+  return out;
+}
+
+/* ---------- parsing questions ---------- */
+function parseQuestions(text) {
+  const qs = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const p = line.split(/\s+/);
+    if (p.length === 1 && /^\d+$/.test(p[0])) continue; // count line
+    if (p.length < 5) throw new Error(`Need "id unit co bloom difficulty": "${line}"`);
+    const [id, unit, co, bloom, diff] = p;
+    const B = bloom.toUpperCase(), D = diff.toUpperCase();
+    if (!LEVELS.includes(B)) throw new Error(`Bad bloom level "${bloom}" in "${line}"`);
+    if (!DIFFS.includes(D)) throw new Error(`Bad difficulty "${diff}" in "${line}"`);
+    qs.push({ id, unit, co: co.toUpperCase(), bloom: B, diff: D });
+  }
+  return qs;
+}
+
+/* ---------- index: one bitset per attribute value ---------- */
+function buildIndex(qs) {
+  const n = qs.length, idx = new Map();
+  const get = k => { let b = idx.get(k); if (!b) { b = bsNew(n); idx.set(k, b); } return b; };
+  qs.forEach((q, i) => {
+    bsSet(get('unit=' + q.unit), i);
+    bsSet(get('co=' + q.co), i);
+    bsSet(get('bloom=' + q.bloom), i);
+    bsSet(get('diff=' + q.diff), i);
+  });
+  return { n, qs, idx, empty: bsNew(n) };
+}
+
+/* ---------- query tokenizer + recursive-descent parser ----------
+   expr    := andE (OR andE)*
+   andE    := unary ((AND)? unary)*
+   unary   := NOT unary | primary
+   primary := '(' expr ')' | term                                  */
+function tokenize(s) {
+  return s.replace(/\(/g, ' ( ').replace(/\)/g, ' ) ').trim().split(/\s+/).filter(Boolean);
+}
+
+function parseQuery(src) {
+  const toks = tokenize(src);
+  let p = 0;
+  const peek = () => toks[p];
+  const up = () => (toks[p] || '').toUpperCase();
+  const eat = () => toks[p++];
+
+  function expr() {
+    let l = andE();
+    while (up() === 'OR') { eat(); l = { t: 'or', l, r: andE() }; }
+    return l;
+  }
+  function andE() {
+    let l = unary();
+    while (p < toks.length && up() !== 'OR' && up() !== ')') {
+      if (up() === 'AND') eat();
+      l = { t: 'and', l, r: unary() };
+    }
+    return l;
+  }
+  function unary() {
+    if (up() === 'NOT') { eat(); return { t: 'not', a: unary() }; }
+    return primary();
+  }
+  function primary() {
+    const tk = peek();
+    if (tk === undefined) throw new Error('Unexpected end of query');
+    if (tk === '(') {
+      eat(); const e = expr();
+      if (peek() !== ')') throw new Error('Missing closing )');
+      eat(); return e;
+    }
+    if (tk === ')' || up() === 'AND' || up() === 'OR') throw new Error(`Unexpected "${tk}"`);
+    eat();
+    const m = tk.match(/^([A-Za-z]+)(<=|>=|=)(.+)$/);
+    if (!m) throw new Error(`Bad term "${tk}" (use attr=value, e.g. unit=1)`);
+    return { t: 'term', attr: m[1].toLowerCase(), op: m[2], val: m[3] };
+  }
+
+  const ast = expr();
+  if (p < toks.length) throw new Error(`Unexpected "${toks[p]}"`);
+  return ast;
+}
+
+/* ---------- evaluation over bitsets ---------- */
+function termBitset(ix, attr, op, val) {
+  let v = val.toUpperCase();
+  if (attr === 'maxbloom') { attr = 'bloom'; op = '<='; }
+  if (attr === 'difficulty') attr = 'diff';
+  if (!['unit', 'co', 'bloom', 'diff'].includes(attr)) throw new Error(`Unknown attribute "${attr}"`);
+
+  if (attr === 'bloom' && op !== '=') {                 // bloom <= / >= : OR of level bitsets
+    const li = LEVELS.indexOf(v);
+    if (li < 0) throw new Error(`Bad bloom level "${val}"`);
+    const r = bsNew(ix.n);
+    LEVELS.forEach((L, j) => {
+      if (op === '<=' ? j <= li : j >= li) {
+        const b = ix.idx.get('bloom=' + L);
+        if (b) for (let i = 0; i < r.length; i++) r[i] |= b[i];
+      }
+    });
+    return r;
+  }
+  if (op !== '=') throw new Error(`Operator ${op} is only allowed on bloom`);
+  if (attr === 'unit') v = val;
+  return ix.idx.get(attr + '=' + v) || ix.empty;
+}
+
+function evalAst(node, ix) {
+  switch (node.t) {
+    case 'term': return termBitset(ix, node.attr, node.op, node.val);
+    case 'not':  return bsNot(evalAst(node.a, ix), ix.n);
+    case 'and':  return bsAnd(evalAst(node.l, ix), evalAst(node.r, ix));
+    case 'or':   return bsOr(evalAst(node.l, ix), evalAst(node.r, ix));
+  }
+}
+
+/* ---------- run one FIND [RANK] command ---------- */
+function runQuery(line, ix) {
+  const m = line.trim().replace(/^FIND\s+/i, '').match(/^(.*?)(?:\s+RANK\b\s*(.*))?$/i);
+  const expr = m[1], rankSpec = m[2];
+  if (!expr.trim()) throw new Error('Empty query');
+
+  const idxs = bsIndexes(evalAst(parseQuery(expr), ix), ix.n);
+
+  // ranking: score each hit by the requested share of its difficulty; ties keep input order
+  let mix = null;
+  if (rankSpec !== undefined) {
+    mix = { EASY: 0, MEDIUM: 0, HARD: 0 };
+    const re = /(easy|medium|hard)\s*=\s*(\d+(?:\.\d+)?)/gi;
+    let x, found = 0;
+    while ((x = re.exec(rankSpec))) { mix[x[1].toUpperCase()] = +x[2]; found++; }
+    if (!found) throw new Error('RANK needs e.g. easy=30 medium=50 hard=20');
+    if (!(mix.EASY + mix.MEDIUM + mix.HARD > 0)) throw new Error('RANK weights must not all be 0');
+  }
+  let order = idxs.map(i => ({ i, score: null }));
+  if (mix) {
+    const tot = mix.EASY + mix.MEDIUM + mix.HARD;
+    order.forEach(o => o.score = mix[ix.qs[o.i].diff] / tot);
+    order.sort((a, b) => b.score - a.score || a.i - b.i);
+  }
+
+  // count per unit summary
+  const perUnit = new Map();
+  for (const i of idxs) { const u = ix.qs[i].unit; perUnit.set(u, (perUnit.get(u) || 0) + 1); }
+  const units = [...perUnit.keys()].sort((a, b) => a - b);
+
+  const lines = [];
+  lines.push(`Output: ${order.map(o => ix.qs[o.i].id).join(' ') || '(no matches)'}`);
+  lines.push(`Bitset indexes: [${idxs.join(', ')}]`);
+  lines.push(`Matches: ${idxs.length} of ${ix.n}`);
+  lines.push(`Count per unit: ${units.map(u => `unit ${u} = ${perUnit.get(u)}`).join(', ') || '-'}`);
+  if (mix) {
+    const tot = mix.EASY + mix.MEDIUM + mix.HARD;
+    lines.push(`Requested mix: EASY ${(100 * mix.EASY / tot).toFixed(0)}%  MEDIUM ${(100 * mix.MEDIUM / tot).toFixed(0)}%  HARD ${(100 * mix.HARD / tot).toFixed(0)}%`);
+    lines.push('Ranked:');
+    const show = order.slice(0, 50);
+    show.forEach((o, k) => {
+      const q = ix.qs[o.i];
+      lines.push(`  ${k + 1}. ${q.id}  unit ${q.unit}  ${q.co}  ${q.bloom}  ${q.diff}  score ${o.score.toFixed(2)}`);
+    });
+    if (order.length > 50) lines.push(`  ... ${order.length - 50} more`);
+  }
+  return lines.join('\n');
+}
+
+/* ---------- UI ---------- */
+function load(text) {
+  const qs = parseQuestions(text);
+  IX = buildIndex(qs);
+  $('status').textContent = `Indexed ${qs.length} questions, ${IX.idx.size} bitsets.`;
+  $('status').className = 'status';
+}
+
+function show(text, isErr) {
+  $('out').textContent = text;
+  $('out').className = isErr ? 'err' : '';
+}
+
+function run() {
+  if (!IX) return show('Load questions first.', true);
+  try { show(runQuery($('q').value, IX), false); }
+  catch (e) { show('Error: ' + e.message, true); }
+}
+
+function generate(n) {
+  const qs = new Array(n);
+  for (let i = 0; i < n; i++) {
+    qs[i] = { id: 'Q' + (i + 1), unit: String(1 + rnd(20)), co: 'CO' + (1 + rnd(6)),
+              bloom: LEVELS[rnd(6)], diff: DIFFS[rnd(3)] };
+  }
+  return qs;
+}
+
+$('load').onclick = () => { try { load($('qs').value); run(); } catch (e) { $('status').textContent = e.message; $('status').className = 'status err'; } };
+$('run').onclick = run;
+$('q').addEventListener('keydown', e => { if (e.key === 'Enter') run(); });
+document.querySelectorAll('[data-q]').forEach(b => b.onclick = () => { $('q').value = b.dataset.q; run(); });
+
+$('gen').onclick = () => {
+  $('gen').disabled = true; $('status').textContent = 'Generating...';
+  setTimeout(() => {
+    const t = performance.now();
+    IX = buildIndex(generate(100000));
+    const ms = (performance.now() - t).toFixed(0);
+    $('qs').value = `(100,000 random questions, not shown here)`;
+    $('status').textContent = `Indexed 100,000 questions in ${ms} ms.`;
+    $('gen').disabled = false;
+    run();
+  }, 20);
+};
+
+$('stress').onclick = () => {
+  if (!IX) return show('Load or generate questions first.', true);
+  $('stress').disabled = true; show('Running 10,000 queries...', false);
+  setTimeout(() => {
+    const t = performance.now();
+    let total = 0, errors = 0;
+    for (let k = 0; k < 10000; k++) {
+      const q = `FIND unit=${1 + rnd(20)} co=CO${1 + rnd(6)} maxbloom=K${1 + rnd(6)}`;
+      try { total += bsIndexes(evalAst(parseQuery(q.replace(/^FIND\s+/, '')), IX), IX.n).length; }
+      catch (e) { errors++; }
+    }
+    const ms = (performance.now() - t).toFixed(0);
+    show(`10,000 queries over ${IX.n} questions in ${ms} ms\nTotal hits: ${total}\nErrors: ${errors}`, false);
+    $('stress').disabled = false;
+  }, 20);
+};
+
+$('qs').value = SAMPLE;
+load(SAMPLE);
+run();
+</script>
+</body>
+</html>
